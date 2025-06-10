@@ -1,0 +1,223 @@
+[ApiController]
+[Route("[controller]")]
+public class MskController : ControllerBase
+{
+    private readonly KafkaProducerService _producer;
+
+    public MskController(KafkaProducerService producer)
+    {
+        _producer = producer;
+    }
+
+    [HttpPost("produce")]
+    public async Task<IActionResult> Produce([FromBody] string message)
+    {
+        await _producer.SendMessageAsync(message);
+        return Ok(new { status = "Message sent" });
+    }
+}
+
+public class KafkaProducerService
+{
+    private readonly IProducer<Null, string> _producer;
+    private readonly string _topic = "test-topic";
+
+    public KafkaProducerService(IConfiguration config)
+    {
+        var producerConfig = new ProducerConfig
+        {
+            BootstrapServers = config["Kafka:BootstrapServers"]
+        };
+
+        _producer = new ProducerBuilder<Null, string>(producerConfig).Build();
+    }
+
+    public async Task SendMessageAsync(string message)
+    {
+        await _producer.ProduceAsync(_topic, new Message<Null, string> { Value = message });
+    }
+}
+
+public class KafkaConsumerService : BackgroundService
+{
+    private readonly ILogger<KafkaConsumerService> _logger;
+    private readonly IConfiguration _config;
+
+    public KafkaConsumerService(ILogger<KafkaConsumerService> logger, IConfiguration config)
+    {
+        _logger = logger;
+        _config = config;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        var config = new ConsumerConfig
+        {
+            BootstrapServers = _config["Kafka:BootstrapServers"],
+            GroupId = "test-group",
+            AutoOffsetReset = AutoOffsetReset.Earliest
+        };
+
+        using var consumer = new ConsumerBuilder<Ignore, string>(config).Build();
+        consumer.Subscribe("test-topic");
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                var cr = consumer.Consume(stoppingToken);
+                _logger.LogInformation($"Consumed message: {cr.Message.Value}");
+                // Add your business logic here
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error consuming message");
+            }
+        }
+    }
+}
+
+builder.Services.AddSingleton<KafkaProducerService>();
+builder.Services.AddHostedService<KafkaConsumerService>();
+
+--------------------------------------------------------------------------
+
+public class KafkaProducerService
+{
+    private readonly IProducer<string, string> _producer;
+    private readonly string _topic;
+
+    public KafkaProducerService(IConfiguration config)
+    {
+        var kafkaConfig = new ProducerConfig
+        {
+            BootstrapServers = config["Kafka:BootstrapServers"],
+            SecurityProtocol = SecurityProtocol.SaslSsl,
+            SaslMechanism = SaslMechanism.Plain,
+            SaslUsername = "unused",
+            SaslPassword = "unused",
+            SaslJaasConfig = "software.amazon.msk.auth.iam.IAMLoginModule required;",
+            SaslOauthbearerMethod = "default",
+            ClientId = "dotnet-client"
+        };
+
+        _topic = config["Kafka:Topic"];
+        _producer = new ProducerBuilder<string, string>(kafkaConfig)
+            .SetOAuthBearerTokenRefreshHandler((c) => {
+                // IAM plugin handles token automatically
+            })
+            .Build();
+    }
+
+    public async Task ProduceAsync(string message)
+    {
+        await _producer.ProduceAsync(_topic, new Message<string, string> { Key = Guid.NewGuid().ToString(), Value = message });
+    }
+}
+
+public class KafkaConsumerService : BackgroundService
+{
+    private readonly IConfiguration _config;
+    private readonly ILogger<KafkaConsumerService> _logger;
+
+    public KafkaConsumerService(IConfiguration config, ILogger<KafkaConsumerService> logger)
+    {
+        _config = config;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        var consumerConfig = new ConsumerConfig
+        {
+            BootstrapServers = _config["Kafka:BootstrapServers"],
+            GroupId = "msk-dotnet-group",
+            SecurityProtocol = SecurityProtocol.SaslSsl,
+            SaslMechanism = SaslMechanism.Plain,
+            SaslUsername = "unused",
+            SaslPassword = "unused",
+            SaslJaasConfig = "software.amazon.msk.auth.iam.IAMLoginModule required;",
+            SaslOauthbearerMethod = "default",
+            AutoOffsetReset = AutoOffsetReset.Earliest
+        };
+
+        using var consumer = new ConsumerBuilder<string, string>(consumerConfig).Build();
+        consumer.Subscribe(_config["Kafka:Topic"]);
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                var result = consumer.Consume(stoppingToken);
+                _logger.LogInformation($"Consumed: {result.Value}");
+            }
+            catch (ConsumeException ex)
+            {
+                _logger.LogError(ex, "Consume failed.");
+            }
+        }
+    }
+}
+
+[ApiController]
+[Route("[controller]")]
+public class KafkaController : ControllerBase
+{
+    private readonly KafkaProducerService _producer;
+
+    public KafkaController(KafkaProducerService producer)
+    {
+        _producer = producer;
+    }
+
+    [HttpPost("send")]
+    public async Task<IActionResult> Send([FromBody] string message)
+    {
+        await _producer.ProduceAsync(message);
+        return Ok(new { status = "Message sent" });
+    }
+}
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddSingleton<KafkaProducerService>();
+builder.Services.AddHostedService<KafkaConsumerService>();
+
+builder.Services.AddControllers();
+var app = builder.Build();
+
+app.MapControllers();
+app.Run();
+
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS base
+WORKDIR /app
+
+# Install Java and download MSK IAM JAR
+RUN apt-get update && \
+    apt-get install -y default-jre curl unzip && \
+    curl -o msk-iam-auth.jar https://software.amazon.com/msk-auth/latest/msk-iam-auth.jar && \
+    mkdir -p /msk-auth && \
+    mv msk-iam-auth.jar /msk-auth/
+
+# App files
+COPY ./app/publish/ ./
+ENV CLASSPATH="/msk-auth/msk-iam-auth.jar"
+ENV LD_LIBRARY_PATH="/msk-auth"
+EXPOSE 80
+
+ENTRYPOINT ["dotnet", "MskDotnetApp.dll"]
+
+{
+  "Kafka": {
+    "BootstrapServers": "<MSK-bootstrap-url>:9098",
+    "Topic": "your-topic-name"
+  }
+}
+
+{
+  "Effect": "Allow",
+  "Action": [
+    "kafka-cluster:*"
+  ],
+  "Resource": "*"
+}
